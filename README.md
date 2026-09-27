@@ -50,12 +50,19 @@ docker build -t annotation-api . && docker run -p 8000:8000 annotation-api
 
 数据通过 Compose 命名卷 `annotation-data` 持久化（SQLite 文件 `/data/app.db`）。
 
+> **旧版数据库升级**：服务启动时自动以幂等迁移为 `confirmations.location_id`
+> 建立唯一索引（每个歧义记录至多一条确认）。历史无重复的库平滑升级、数据无损，
+> 重启无副作用；若检测到同一歧义记录存在多条历史确认（旧版竞态所致），
+> **不会静默删除或合并任何行**，服务拒绝启动并在日志中给出可定位信息
+> （`document_id` / `annotation_id` / `version_number` / `location_id` /
+> 各确认行 ID 及其所选范围），需人工核查保留哪一条后再启动。
+
 ### 本地开发（不用 Docker）
 
 ```bash
 pip install -r requirements-dev.txt
 uvicorn app.main:app --reload --port 8000   # 数据库默认写入 ./data/app.db
-pytest                                       # 运行测试（162 个用例）
+pytest                                       # 运行测试（169 个用例）
 ```
 
 可用环境变量 `DB_PATH` 指定 SQLite 文件路径。
@@ -98,14 +105,19 @@ unresolved ──选区重现──→ resolved
 ```
 
 - `ambiguous` 批注在确认前**不参与**后续版本的自动迁移，每个新版本只追加一条顺延占位记录；
-- 确认是对某一版歧义记录从候选范围中选定一个范围，确认结果同样只追加、不可更改；
+- 确认是对某一版歧义记录从候选范围中选定一个范围，确认结果只追加、不可更改；
+  **每条歧义记录至多一条确认**——目标记录读取、状态 / 候选校验、既有确认检查与
+  插入在同一个 `BEGIN IMMEDIATE` 写事务内完成，且 `confirmations.location_id`
+  带数据库层唯一索引；并发确认由写锁串行化，竞争失败者稳定返回 `409`，
+  不会覆盖首条确认或留下重复行；
 - 确认占位记录（顺延产生的）会被拒绝（409），请确认原始歧义记录。
 
 ### 只追加（append-only）
 
 - 版本：每次提交全文生成新版本号，旧版本内容不可改；
 - 迁移结果：每条批注在每个版本上各有一条 `locations` 记录，只插入不更新；
-- 确认：写入独立的 `confirmations` 表，查询时计算生效状态（`confirmed`）。
+- 确认：写入独立的 `confirmations` 表，查询时计算生效状态（`confirmed`）；
+  每个 location 至多一条（数据库层唯一索引 + 写事务内检查），并发确认败者返回 409。
 
 ### 批注改动影响分析
 
@@ -761,6 +773,8 @@ tests/
   test_matching.py  # 匹配算法单元测试
   test_diffing.py   # 编辑片段/投影/分类单元测试
   test_api.py       # 端到端流程测试（迁移/歧义/顺延/确认/对比）
+  test_annotation_race.py      # 并发回归：批注创建与新版提交的写事务交错
+  test_confirmation_race.py    # 并发回归：同一歧义记录并发确认（不同/相同候选）与唯一索引迁移
   test_impact.py    # 改动影响分析接口端到端测试
   test_review.py    # 审阅依赖编排测试（依赖校验/环检测/审阅计划/完成记录）
   test_gate.py      # 发布门禁测试（策略语法拒绝/修订只追加/同事务快照评估/不短路解释树/稳定性）

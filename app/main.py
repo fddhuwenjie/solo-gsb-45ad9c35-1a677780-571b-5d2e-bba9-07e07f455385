@@ -641,44 +641,59 @@ def confirm_annotation(
     payload: ConfirmationCreate,
     con=Depends(get_db),
 ):
-    """人工确认歧义批注：从候选范围中选定一个（只追加，确认后恢复自动迁移）。"""
+    """人工确认歧义批注：从候选范围中选定一个（只追加，确认后恢复自动迁移）。
+
+    目标版本 / 迁移记录读取、状态与候选校验、既有确认检查与插入全部在**同一个
+    BEGIN IMMEDIATE 写事务**中完成：两个并发确认由 SQLite 写锁串行化，后来者在
+    锁内重新读到首条确认并返回 409；数据库层 ``confirmations.location_id`` 唯一
+    索引是兜底防线（命中时同样返回 409）。竞争失败的请求不会覆盖首条确认，
+    也不会留下重复行。
+    """
     _get_document(con, document_id)
     _get_annotation(con, document_id, annotation_id)
-    version = _get_version(con, document_id, payload.version_number)
-    loc = con.execute(
-        "SELECT * FROM locations WHERE annotation_id = ? AND version_id = ?",
-        (annotation_id, version["id"]),
-    ).fetchone()
-    if loc is None:
-        raise HTTPException(404, "该版本没有此批注的迁移记录")
-    if loc["status"] != "ambiguous":
-        raise HTTPException(409, f"该记录状态为 {loc['status']}，无需确认")
-    if loc["carried_from"] is not None:
-        raise HTTPException(
-            409,
-            "该记录是歧义顺延的占位记录，请确认原始歧义记录"
-            f"（carried_from_location_id={loc['carried_from']}）",
-        )
-    if _confirmation_of(con, loc["id"]) is not None:
-        raise HTTPException(409, "该歧义记录已确认过，确认结果只追加不可更改")
-
-    candidates = json.loads(loc["candidates"])
-    if not any(
-        c["start"] == payload.start and c["end"] == payload.end for c in candidates
-    ):
-        raise HTTPException(
-            422,
-            "所选范围不在候选列表中，候选范围为："
-            + json.dumps(
-                [[c["start"], c["end"]] for c in candidates], ensure_ascii=False
-            ),
-        )
-
     with db.transaction(con):
-        cur = con.execute(
-            'INSERT INTO confirmations (location_id, start, "end", note) VALUES (?, ?, ?, ?)',
-            (loc["id"], payload.start, payload.end, payload.note),
-        )
+        version = _get_version(con, document_id, payload.version_number)
+        loc = con.execute(
+            "SELECT * FROM locations WHERE annotation_id = ? AND version_id = ?",
+            (annotation_id, version["id"]),
+        ).fetchone()
+        if loc is None:
+            raise HTTPException(404, "该版本没有此批注的迁移记录")
+        if loc["status"] != "ambiguous":
+            raise HTTPException(409, f"该记录状态为 {loc['status']}，无需确认")
+        if loc["carried_from"] is not None:
+            raise HTTPException(
+                409,
+                "该记录是歧义顺延的占位记录，请确认原始歧义记录"
+                f"（carried_from_location_id={loc['carried_from']}）",
+            )
+        if _confirmation_of(con, loc["id"]) is not None:
+            raise HTTPException(409, "该歧义记录已确认过，确认结果只追加不可更改")
+
+        candidates = json.loads(loc["candidates"])
+        if not any(
+            c["start"] == payload.start and c["end"] == payload.end for c in candidates
+        ):
+            raise HTTPException(
+                422,
+                "所选范围不在候选列表中，候选范围为："
+                + json.dumps(
+                    [[c["start"], c["end"]] for c in candidates], ensure_ascii=False
+                ),
+            )
+
+        try:
+            cur = con.execute(
+                'INSERT INTO confirmations (location_id, start, "end", note)'
+                " VALUES (?, ?, ?, ?)",
+                (loc["id"], payload.start, payload.end, payload.note),
+            )
+        except sqlite3.IntegrityError:
+            # 唯一索引兜底：并发下首条确认已落库（锁内检查与插入之间无其他
+            # 写入路径会走到这里，仅在极端交错时命中），稳定 409、不覆盖首条
+            raise HTTPException(
+                409, "该歧义记录已确认过，确认结果只追加不可更改"
+            ) from None
         confirmation_id = cur.lastrowid
     return {
         "confirmation_id": confirmation_id,
