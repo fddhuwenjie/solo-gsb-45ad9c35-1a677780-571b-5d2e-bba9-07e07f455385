@@ -1,7 +1,8 @@
 """SQLite 存储层。
 
 版本、迁移结果、审阅依赖、完成记录与门禁策略修订均只追加（append-only）：
-不提供任何 UPDATE/DELETE 路径，人工确认以新行追加到 confirmations 表，
+不提供任何 UPDATE/DELETE 路径，人工确认以新行追加到 confirmations 表
+（同一 location 至多一条，由唯一索引 idx_confirm_loc_unique 保证），
 同名门禁策略的每次提交都以递增 revision 追加到 policy_revisions 表。
 """
 from __future__ import annotations
@@ -58,7 +59,8 @@ CREATE TABLE IF NOT EXISTS locations (
     UNIQUE (annotation_id, version_id)
 );
 
--- 人工确认（只追加；确认后对应 location 的生效状态变为 confirmed）
+-- 人工确认（只追加；确认后对应 location 的生效状态变为 confirmed；
+-- 同一 location 至多一条确认，由唯一索引 idx_confirm_loc_unique 保证）
 CREATE TABLE IF NOT EXISTS confirmations (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     location_id INTEGER NOT NULL REFERENCES locations (id),
@@ -103,7 +105,12 @@ CREATE TABLE IF NOT EXISTS policy_revisions (
 CREATE INDEX IF NOT EXISTS idx_versions_doc    ON versions (document_id, number);
 CREATE INDEX IF NOT EXISTS idx_locations_ann   ON locations (annotation_id);
 CREATE INDEX IF NOT EXISTS idx_locations_ver   ON locations (version_id);
-CREATE INDEX IF NOT EXISTS idx_confirm_loc     ON confirmations (location_id);
+-- 每个 location 至多一条人工确认：唯一索引取代旧版的非唯一索引
+-- idx_confirm_loc（DROP + CREATE 均幂等；既有库中的历史重复由
+-- init_db 在执行本脚本前预检并报出，见 _assert_no_duplicate_confirmations）
+DROP INDEX IF EXISTS idx_confirm_loc;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_confirm_loc_unique
+    ON confirmations (location_id);
 CREATE INDEX IF NOT EXISTS idx_dependencies_doc ON dependencies (document_id);
 CREATE INDEX IF NOT EXISTS idx_completions_doc  ON completions (document_id);
 CREATE INDEX IF NOT EXISTS idx_policy_name      ON policy_revisions (name, revision);
@@ -149,12 +156,50 @@ def read_transaction(con: sqlite3.Connection):
         con.execute("COMMIT")
 
 
+def _assert_no_duplicate_confirmations(con: sqlite3.Connection) -> None:
+    """建立 confirmations.location_id 唯一索引前的预检（既有库平滑迁移）。
+
+    历史版本没有该唯一约束，并发确认可能在同一 location 上留下多条确认。
+    检测到这类历史重复时**不静默删改**：抛出带可定位 location_id 与确认
+    行 ID 的 RuntimeError，由人工核对清理后再启动；无重复（或全新库，
+    表尚不存在）时直接返回，随后由 SCHEMA 建立唯一索引。
+
+    init_db 在服务接受请求之前单线程执行，预检与建索引之间不会夹入并发写入。
+    """
+    table_exists = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'confirmations'"
+    ).fetchone()
+    if table_exists is None:
+        return
+    duplicates = con.execute(
+        """
+        SELECT location_id, GROUP_CONCAT(id) AS confirmation_ids
+        FROM confirmations
+        GROUP BY location_id
+        HAVING COUNT(*) > 1
+        ORDER BY location_id
+        """
+    ).fetchall()
+    if duplicates:
+        detail = "；".join(
+            f"location_id={row['location_id']}"
+            f"（确认行 ID：{row['confirmation_ids']}）"
+            for row in duplicates
+        )
+        raise RuntimeError(
+            "confirmations 表存在历史重复确认（同一迁移记录多条确认），"
+            "唯一约束未建立，也未删改任何数据；"
+            "请人工核对并清理以下位置后再启动：" + detail
+        )
+
+
 def init_db() -> None:
     directory = os.path.dirname(DB_PATH)
     if directory:
         os.makedirs(directory, exist_ok=True)
     con = connect()
     try:
+        _assert_no_duplicate_confirmations(con)
         con.executescript(SCHEMA)
     finally:
         con.close()
